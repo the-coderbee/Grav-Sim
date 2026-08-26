@@ -1,0 +1,15 @@
+[package]
+name = "grav-sim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glam = "0.33.5"
+pollster = "1.0.1"
+wgpu = "30.0.1"
+winit = "0.30.13"
+bytemuck = { version = "1.14", features = ["derive"]}
+rand = "0.8"
+egui = "0.36.1"
+egui-winit = "0.36.1"
+egui-wgpu = "0.36.1"
