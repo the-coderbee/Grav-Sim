@@ -3,6 +3,7 @@ use bytemuck::{Pod, Zeroable};
 pub struct UiState {
     pub dt: f32,
     pub g_const: f32,
+    pub theta: f32,
     pub paused: bool,
     pub fps: f32,
 }
@@ -14,4 +15,5 @@ pub struct SimParams {
     pub softening: f32,
     pub dt: f32,
     pub particle_count: u32,
+    pub theta: f32,
 }

@@ -13,13 +13,14 @@ use crate::particle::{GalaxyConfig, GpuParticle, generate_galaxy};
 use crate::ui::{SimParams, UiState};
 
 pub struct State {
-    // the order is needed to prevent segmentation fault.
+    // the order is must to maintain the drop order after execution.
     pub render_pipeline: wgpu::RenderPipeline,
     pub compute_pipeline: wgpu::ComputePipeline,
     pub camera_buffer: wgpu::Buffer,
     pub camera_bind_group: wgpu::BindGroup,
     pub quad_buffer: wgpu::Buffer,
     pub compute_bind_groups: [wgpu::BindGroup; 2],
+    pub compute_bind_group_layout: wgpu::BindGroupLayout,
     pub particle_buffers: [wgpu::Buffer; 2],
     pub sim_params_buffer: wgpu::Buffer,
     pub egui_renderer: EguiRenderer,
@@ -32,6 +33,9 @@ pub struct State {
 
     pub egui_state: EguiWinitState,
     pub window: Arc<Window>,
+
+    pub tree_buffer: wgpu::Buffer,
+    pub staging_buffer: wgpu::Buffer,
 
     pub size: winit::dpi::PhysicalSize<u32>,
     pub camera_controller: CameraController,
@@ -95,7 +99,7 @@ impl State {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: surface_caps.present_modes[0],
+            present_mode: wgpu::PresentMode::Mailbox,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -120,6 +124,7 @@ impl State {
             softening: 0.5,
             dt: 0.016,
             particle_count: particle_count,
+            theta: 0.5,
         };
 
         let sim_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -140,8 +145,10 @@ impl State {
 
         let particle_bytes = bytemuck::cast_slice(&gpu_particles);
 
-        let buffer_usage =
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+        let buffer_usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
 
         let buffer_a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Particle Buffer A"),
@@ -191,8 +198,36 @@ impl State {
                         },
                         count: None,
                     },
+                    // Binding 3: tree nodes (Storage, Read-Only)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
+
+        let max_tree_nodes = particle_count as usize * 4;
+        let tree_buffer_size = (max_tree_nodes * std::mem::size_of::<crate::geometry::GpuNode>())
+            as wgpu::BufferAddress;
+
+        let tree_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Tree Storage Buffer"),
+            size: tree_buffer_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Particle Staging Buffer"),
+            size: particle_bytes.len() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let bind_group_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Compute Bind Group A (A -> B)"),
@@ -209,6 +244,10 @@ impl State {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: buffer_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tree_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -228,6 +267,10 @@ impl State {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: buffer_a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tree_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -363,6 +406,7 @@ impl State {
         let ui_state = UiState {
             dt: 0.0016,
             g_const: 1000.0,
+            theta: 0.5,
             paused: false,
             fps: 0.0,
         };
@@ -383,11 +427,16 @@ impl State {
             quad_buffer,
 
             compute_pipeline,
+            compute_bind_group_layout,
             compute_bind_groups: [bind_group_a, bind_group_b],
             particle_buffers: [buffer_a, buffer_b],
             sim_params_buffer,
             frame_count: 0,
             particle_count,
+
+            tree_buffer,
+            staging_buffer,
+
             // egui
             egui_ctx,
             egui_state,
@@ -420,12 +469,6 @@ impl State {
             0,
             bytemuck::bytes_of(&self.camera_uniform),
         );
-        // Example of how you will use it later in update()
-        // self.queue.write_buffer(
-        //     &self.sim_params_buffer,
-        //     0,
-        //     bytemuck::bytes_of(&new_sim_params),
-        // );
     }
 
     pub fn render(&mut self) -> Result<(), String> {
@@ -465,6 +508,10 @@ impl State {
                     egui::Slider::new(&mut self.ui_state.g_const, -2000.0..=5000.0)
                         .text("Gravity (G)"),
                 );
+                ui.add(
+                    egui::Slider::new(&mut self.ui_state.theta, 0.25..=2.0)
+                        .text("Theta (accuracy vs speed)"),
+                );
                 if ui.button("Reset Camera").clicked() {
                     self.camera_controller.pan = glam::Vec2::ZERO;
                     self.camera_controller.zoom = 0.05;
@@ -493,10 +540,109 @@ impl State {
             softening: 0.5,
             dt: active_dt,
             particle_count: self.particle_count,
+            theta: self.ui_state.theta,
         };
 
         self.queue
             .write_buffer(&self.sim_params_buffer, 0, bytemuck::bytes_of(&new_params));
+
+        // determine which buffer was written to last frame
+        let source_buffer_index = self.frame_count % 2;
+        let active_source_buffer = &self.particle_buffers[source_buffer_index];
+
+        // copy active particle buffer to the staging buffer
+        let mut transfer_encoder =
+            self.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Staging Transfer Encoder"),
+                });
+
+        transfer_encoder.copy_buffer_to_buffer(
+            active_source_buffer,
+            0,
+            &self.staging_buffer,
+            0,
+            (self.particle_count as usize * std::mem::size_of::<crate::particle::GpuParticle>())
+                as wgpu::BufferAddress,
+        );
+        self.queue
+            .submit(std::iter::once(transfer_encoder.finish()));
+
+        // map the staging buffer and block until the GPU finishes copying
+        let buffer_slice = self.staging_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        receiver
+            .recv()
+            .unwrap()
+            .expect("Failed to map staging buffer");
+
+        let quadtree = {
+            let data = buffer_slice
+                .get_mapped_range()
+                .expect("Failed to get mapped range");
+            let gpu_particles: &[crate::particle::GpuParticle] = bytemuck::cast_slice(&data);
+
+            let positions: Vec<[f32; 2]> = gpu_particles.iter().map(|p| p.pos).collect();
+            let masses: Vec<f32> = gpu_particles.iter().map(|p| p.mass).collect();
+
+            crate::geometry::QuadTree::build(&positions, &masses)
+        };
+
+        // 5. Unmap so WGPU can reuse the staging buffer next frame
+        self.staging_buffer.unmap();
+
+        let needed_bytes = (quadtree.nodes.len() * std::mem::size_of::<crate::geometry::GpuNode>())
+            as wgpu::BufferAddress;
+
+        if needed_bytes > self.tree_buffer.size() {
+            let new_size = needed_bytes + needed_bytes / 2;
+            self.tree_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Tree Storage Buffer"),
+                size: new_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            for (i, bind_group) in self.compute_bind_groups.iter_mut().enumerate() {
+                let (src, dst) = if i == 0 {
+                    (&self.particle_buffers[0], &self.particle_buffers[1])
+                } else {
+                    (&self.particle_buffers[1], &self.particle_buffers[0])
+                };
+                *bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Compute Bind Group (rebuilt)"),
+                    layout: &self.compute_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.sim_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: src.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: dst.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.tree_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+            }
+        }
+
+        // 6. Upload the newly built tree to VRAM
+        self.queue
+            .write_buffer(&self.tree_buffer, 0, bytemuck::cast_slice(&quadtree.nodes));
 
         let mut encoder = self
             .device
