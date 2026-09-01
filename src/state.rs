@@ -10,6 +10,7 @@ use egui_winit::State as EguiWinitState;
 use std::time::Instant;
 
 use crate::camera::{CameraController, CameraUniform};
+use crate::geometry::QuadTree;
 use crate::geometry::{QUAD_VERTICES, QuadVertex};
 use crate::particle::{GalaxyConfig, GpuParticle, generate_galaxy};
 use crate::ui::{SimParams, UiState};
@@ -101,6 +102,8 @@ pub struct State {
 
     pub tree_buffer: wgpu::Buffer,
     pub staging_buffer: wgpu::Buffer,
+
+    pub quadtree: QuadTree,
 
     pub size: winit::dpi::PhysicalSize<u32>,
     pub camera_controller: CameraController,
@@ -279,6 +282,7 @@ impl State {
             });
 
         let max_tree_nodes = particle_count as usize * 4;
+        let quadtree = QuadTree::new(max_tree_nodes);
         let tree_buffer_size = (max_tree_nodes * std::mem::size_of::<crate::geometry::GpuNode>())
             as wgpu::BufferAddress;
 
@@ -504,6 +508,8 @@ impl State {
             tree_buffer,
             staging_buffer,
 
+            quadtree,
+
             // egui
             egui_ctx,
             egui_state,
@@ -593,6 +599,11 @@ impl State {
                     self.profiler.avg("render"),
                     self.profiler.max("render")
                 ));
+                ui.label(format!(
+                    "Node Count: {:.1} (max {:.1})",
+                    self.profiler.avg("node_count"),
+                    self.profiler.max("node_count")
+                ));
                 ui.separator();
 
                 ui.checkbox(&mut self.ui_state.paused, "Pause Simulation");
@@ -681,7 +692,7 @@ impl State {
 
         let tree_build_start = Instant::now();
 
-        let quadtree = {
+        {
             let data = buffer_slice
                 .get_mapped_range()
                 .expect("Failed to get mapped range");
@@ -690,13 +701,17 @@ impl State {
             let positions: Vec<[f32; 2]> = gpu_particles.iter().map(|p| p.pos).collect();
             let masses: Vec<f32> = gpu_particles.iter().map(|p| p.mass).collect();
 
-            crate::geometry::QuadTree::build(&positions, &masses)
+            self.quadtree.build(&positions, &masses);
         };
+
+        self.profiler
+            .record("node_count", self.quadtree.nodes.len() as f32);
 
         // 5. Unmap so WGPU can reuse the staging buffer next frame
         self.staging_buffer.unmap();
 
-        let needed_bytes = (quadtree.nodes.len() * std::mem::size_of::<crate::geometry::GpuNode>())
+        let needed_bytes = (self.quadtree.nodes.len()
+            * std::mem::size_of::<crate::geometry::GpuNode>())
             as wgpu::BufferAddress;
 
         if needed_bytes > self.tree_buffer.size() {
@@ -742,8 +757,11 @@ impl State {
 
         let tree_upload_start = Instant::now();
         // 6. Upload the newly built tree to VRAM
-        self.queue
-            .write_buffer(&self.tree_buffer, 0, bytemuck::cast_slice(&quadtree.nodes));
+        self.queue.write_buffer(
+            &self.tree_buffer,
+            0,
+            bytemuck::cast_slice(&self.quadtree.nodes),
+        );
         let tree_upload_end = Instant::now();
         let mut encoder = self
             .device

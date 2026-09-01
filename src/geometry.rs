@@ -71,22 +71,24 @@ pub struct QuadTree {
 }
 
 impl QuadTree {
-    pub fn build(particles: &[[f32; 2]], masses: &[f32]) -> Self {
-        let mut tree = QuadTree {
-            nodes: Vec::with_capacity(particles.len() * 4),
-        };
+    pub fn new(size: usize) -> Self {
+        Self {
+            nodes: Vec::with_capacity(size),
+        }
+    }
 
-        let bounds = tree.calculate_root_bounds(particles);
+    pub fn build(&mut self, particles: &[[f32; 2]], masses: &[f32]) {
+        self.nodes.clear();
 
-        tree.nodes.push(GpuNode::new_empty(bounds.half_width * 2.0));
+        let bounds = self.calculate_root_bounds(particles);
+
+        self.nodes.push(GpuNode::new_empty(bounds.half_width * 2.0));
 
         for (i, &pos) in particles.iter().enumerate() {
-            tree.insert(0, pos, masses[i], bounds);
+            self.insert(0, pos, masses[i], bounds);
         }
 
-        tree.compute_mass_distribution(0);
-
-        tree
+        self.compute_mass_distribution(0);
     }
 
     fn calculate_root_bounds(&self, particles: &[[f32; 2]]) -> BoundingBox {
