@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -11,6 +13,69 @@ use crate::camera::{CameraController, CameraUniform};
 use crate::geometry::{QUAD_VERTICES, QuadVertex};
 use crate::particle::{GalaxyConfig, GpuParticle, generate_galaxy};
 use crate::ui::{SimParams, UiState};
+
+pub struct StageStats {
+    samples: VecDeque<f32>,
+    capacity: usize,
+    max_in_window: f32,
+}
+
+impl StageStats {
+    pub fn new(capacity: usize) -> Self {
+        let samples: VecDeque<f32> = VecDeque::new();
+        Self {
+            samples,
+            capacity,
+            max_in_window: 0.0,
+        }
+    }
+    pub fn record(&mut self, sample: f32) {
+        if self.samples.len() >= self.capacity {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(sample);
+        self.max_in_window = self.samples.iter().copied().fold(f32::MIN, f32::max);
+    }
+
+    pub fn avg(&self) -> f32 {
+        if self.samples.is_empty() {
+            return 0.0;
+        }
+        return self.samples.iter().sum::<f32>() / self.samples.len() as f32;
+    }
+}
+
+pub struct Profiler {
+    stages: HashMap<&'static str, StageStats>,
+    window: usize,
+}
+impl Profiler {
+    pub fn new(window: usize) -> Self {
+        Self {
+            stages: HashMap::new(),
+            window,
+        }
+    }
+
+    pub fn record(&mut self, name: &'static str, sample: f32) {
+        let stats: &mut StageStats = self
+            .stages
+            .entry(name)
+            .or_insert_with(|| StageStats::new(self.window));
+        stats.record(sample);
+    }
+
+    pub fn avg(&self, name: &'static str) -> f32 {
+        self.stages.get(name).map(|x| x.avg()).unwrap_or(0.0)
+    }
+
+    pub fn max(&self, name: &'static str) -> f32 {
+        self.stages
+            .get(name)
+            .map(|x| x.max_in_window)
+            .unwrap_or(0.0)
+    }
+}
 
 pub struct State {
     // the order is must to maintain the drop order after execution.
@@ -45,6 +110,7 @@ pub struct State {
     pub egui_ctx: egui::Context,
     pub ui_state: UiState,
     pub last_frame_time: Instant,
+    pub profiler: Profiler,
 }
 
 impl State {
@@ -411,6 +477,7 @@ impl State {
             fps: 0.0,
         };
         let last_frame_time = Instant::now();
+        let profiler = Profiler::new(60);
 
         Self {
             window,
@@ -443,6 +510,7 @@ impl State {
             egui_renderer,
             ui_state,
             last_frame_time,
+            profiler,
         }
     }
 
@@ -472,6 +540,7 @@ impl State {
     }
 
     pub fn render(&mut self) -> Result<(), String> {
+        let render_start = Instant::now();
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture) => texture,
             wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
@@ -498,6 +567,32 @@ impl State {
             egui::Window::new("Simulation Controls").show(ctx, |ui| {
                 ui.label(format!("FPS: {:.1}", self.ui_state.fps));
                 ui.label(format!("Particles: {}", self.particle_count));
+                ui.separator();
+                ui.label(format!(
+                    "Tree Build: {:.2}ms (max {:.2}ms)",
+                    self.profiler.avg("tree_build"),
+                    self.profiler.max("tree_build")
+                ));
+                ui.label(format!(
+                    "Tree Upload: {:.2}ms (max {:.2}ms)",
+                    self.profiler.avg("tree_upload"),
+                    self.profiler.max("tree_upload")
+                ));
+                ui.label(format!(
+                    "Buffer Write: {:.2}ms (max {:.2}ms)",
+                    self.profiler.avg("buffer_write"),
+                    self.profiler.max("buffer_write")
+                ));
+                ui.label(format!(
+                    "Stall: {:.2}ms (max {:.2}ms)",
+                    self.profiler.avg("stall"),
+                    self.profiler.max("stall")
+                ));
+                ui.label(format!(
+                    "Render: {:.2}ms (max {:.2}ms)",
+                    self.profiler.avg("render"),
+                    self.profiler.max("render")
+                ));
                 ui.separator();
 
                 ui.checkbox(&mut self.ui_state.paused, "Pause Simulation");
@@ -535,6 +630,7 @@ impl State {
         } else {
             self.ui_state.dt
         };
+        let write_buffer_start = Instant::now();
         let new_params = SimParams {
             g_const: self.ui_state.g_const,
             softening: 0.5,
@@ -567,6 +663,7 @@ impl State {
         );
         self.queue
             .submit(std::iter::once(transfer_encoder.finish()));
+        let write_buffer_end = Instant::now();
 
         // map the staging buffer and block until the GPU finishes copying
         let buffer_slice = self.staging_buffer.slice(..);
@@ -581,6 +678,8 @@ impl State {
             .recv()
             .unwrap()
             .expect("Failed to map staging buffer");
+
+        let tree_build_start = Instant::now();
 
         let quadtree = {
             let data = buffer_slice
@@ -639,11 +738,13 @@ impl State {
                 });
             }
         }
+        let tree_build_end = Instant::now();
 
+        let tree_upload_start = Instant::now();
         // 6. Upload the newly built tree to VRAM
         self.queue
             .write_buffer(&self.tree_buffer, 0, bytemuck::cast_slice(&quadtree.nodes));
-
+        let tree_upload_end = Instant::now();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -724,6 +825,23 @@ impl State {
         self.queue.submit(std::iter::once(encoder.finish()));
         self.window.pre_present_notify();
         self.queue.present(surface_texture);
+        let render_end = Instant::now();
+
+        let stall_duration = tree_build_start.duration_since(write_buffer_end);
+        let buffer_write_duration = write_buffer_end.duration_since(write_buffer_start);
+        let tree_build_duration = tree_build_end.duration_since(tree_build_start);
+        let tree_upload_duration = tree_upload_end.duration_since(tree_upload_start);
+        let render_duration = render_end.duration_since(render_start);
+        self.profiler
+            .record("stall", stall_duration.as_secs_f32() * 1000.0);
+        self.profiler
+            .record("buffer_write", buffer_write_duration.as_secs_f32() * 1000.0);
+        self.profiler
+            .record("tree_build", tree_build_duration.as_secs_f32() * 1000.0);
+        self.profiler
+            .record("tree_upload", tree_upload_duration.as_secs_f32() * 1000.0);
+        self.profiler
+            .record("render", render_duration.as_secs_f32() * 1000.0);
 
         self.frame_count += 1;
 
