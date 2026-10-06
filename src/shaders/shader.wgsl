@@ -2,6 +2,8 @@ struct CameraUniform {
     pan: vec2<f32>,
     zoom: f32,
     aspect_ratio: f32,
+    screen_height: f32,
+    _padding: f32,
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -35,7 +37,9 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     }
 
     // 2. Orbiting Stars Setup
-    let radius = 0.25;
+    let min_radius_px = 1.0;
+    let world_per_px = 2.0;
+    let radius = max(0.25, min_radius_px * world_per_px);
 
     // Calculate distance from the exact center of the galaxy (0,0)
     let dist_from_center = length(instance.pos);
@@ -77,6 +81,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Use the dynamic distance-based color passed directly from the vertex shader
     var color = in.color;
     color.a *= alpha_falloff;
+
+    let brightness = 0.12;
+    color = vec4<f32>(color.rgb * brightness, color.a);
 
     return color;
 }

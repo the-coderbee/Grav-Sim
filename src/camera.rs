@@ -6,7 +6,9 @@ use glam::Vec2;
 pub struct CameraUniform {
     pub pan: [f32; 2],
     pub zoom: f32,
-    pub aspect_ration: f32,
+    pub aspect_ratio: f32,
+    pub screen_height: f32,
+    pub _padding: f32,
 }
 
 pub struct CameraController {

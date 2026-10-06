@@ -369,12 +369,14 @@ impl State {
         });
 
         let camera_controller = CameraController::new();
-        let aspect_ration = size.width as f32 / size.height as f32;
+        let aspect_ratio = size.width as f32 / size.height as f32;
 
         let camera_uniform = CameraUniform {
             pan: camera_controller.pan.to_array(),
             zoom: camera_controller.zoom,
-            aspect_ration,
+            aspect_ratio,
+            screen_height: size.height as f32,
+            _padding: 0.0,
         };
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -434,7 +436,14 @@ impl State {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_config.format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent::OVER,
+                    }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -536,7 +545,8 @@ impl State {
     pub fn update(&mut self) {
         self.camera_uniform.pan = self.camera_controller.pan.to_array();
         self.camera_uniform.zoom = self.camera_controller.zoom;
-        self.camera_uniform.aspect_ration = self.size.width as f32 / self.size.height as f32;
+        self.camera_uniform.aspect_ratio = self.size.width as f32 / self.size.height as f32;
+        self.camera_uniform.screen_height = self.size.height as f32;
 
         self.queue.write_buffer(
             &self.camera_buffer,

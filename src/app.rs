@@ -29,7 +29,7 @@ impl ApplicationHandler for App {
         if self.state.is_none() {
             let window_attributes = Window::default_attributes()
                 .with_title("GravSim - Particle Simulator [Winit + WGPU]")
-                .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0))
+                .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
                 .with_visible(true);
 
             let window = Arc::new(event_loop.create_window(window_attributes).unwrap());

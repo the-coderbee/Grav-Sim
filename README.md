@@ -3,9 +3,9 @@
 A GPU-accelerated 2D gravitational N-body simulation written in Rust. It uses the Barnes-Hut algorithm on wgpu compute shaders and simulates a 100,000-body galaxy interactively.
 
 <!-- TODO: replace with a clean screen recording converted to GIF -->
-![Grav-Sim simulating a 50,000-body galaxy](docs/demo.gif)
+![Grav-Sim simulating a 50,000-body galaxy](docs/grav-sim.gif)
 
-![Simulation with the live profiler panel](docs/screenshot.png)
+![Simulation with the live profiler panel](docs/grav-sim-ss.png)
 
 ## What it does
 
@@ -28,7 +28,7 @@ The θ parameter controls the trade-off. A tree node is approximated as one mass
 3. **Upload the tree** to a GPU storage buffer.
 4. **Compute pass:** one thread per particle (workgroups of 256) traverses the tree with an explicit stack, since WGSL has no recursion, and accumulates acceleration from nodes that pass the θ test.
 5. **Integrate** with semi-implicit (symplectic) Euler: velocity first, then position using the new velocity. A softening term in the distance prevents the force from blowing up when two particles get very close.
-6. **Render** all particles in a single instanced draw call, colour-graded by distance from the galactic centre, followed by the egui panel.
+6. **Render** all particles in a single instanced draw call, colour-graded by distance from the galactic centre, followed by the egui panel. Stars use additive blending, so overlapping light accumulates and dense regions such as the core and clusters glow brighter than sparse ones. A minimum on-screen size keeps stars visible at any zoom level.
 
 Particle state lives in two buffers used in a ping-pong arrangement: each frame reads from one and writes to the other, so no thread ever reads a position that another thread has already updated in the same step.
 
