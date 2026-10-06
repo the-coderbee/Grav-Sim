@@ -2,7 +2,6 @@
 
 A GPU-accelerated 2D gravitational N-body simulation written in Rust. It uses the Barnes-Hut algorithm on wgpu compute shaders and simulates a 100,000-body galaxy interactively.
 
-<!-- TODO: replace with a clean screen recording converted to GIF -->
 ![Grav-Sim simulating a 50,000-body galaxy](docs/grav-sim.gif)
 
 ![Simulation with the live profiler panel](docs/grav-sim-ss.png)
