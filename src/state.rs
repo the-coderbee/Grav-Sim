@@ -117,7 +117,7 @@ pub struct State {
 }
 
 impl State {
-    pub async fn new(window: Arc<Window>) -> Self {
+    pub async fn new(window: Arc<Window>, requested_particles: usize) -> Self {
         let mut size = window.inner_size();
         if size.width == 0 || size.height == 0 {
             size.width = 800;
@@ -177,7 +177,7 @@ impl State {
         surface.configure(&device, &surface_config);
 
         let galaxy_config = GalaxyConfig {
-            particle_count: 50_000,
+            particle_count: requested_particles,
             central_mass: 150_000.0,
             disk_partial_mass: 1.0,
             g_const: 1000.0,
@@ -547,6 +547,8 @@ impl State {
 
     pub fn render(&mut self) -> Result<(), String> {
         let render_start = Instant::now();
+        self.profiler
+            .record("acquire", render_start.elapsed().as_secs_f32() * 1000.0);
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture) => texture,
             wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
@@ -566,6 +568,7 @@ impl State {
         let frame_time = now.duration_since(self.last_frame_time).as_secs_f32();
         self.last_frame_time = now;
         self.ui_state.fps = 1.0 / frame_time;
+        self.profiler.record("frame_total", frame_time * 1000.0);
 
         // build the ui
         let raw_input = self.egui_state.take_egui_input(&self.window);
@@ -603,6 +606,26 @@ impl State {
                     "Node Count: {:.1} (max {:.1})",
                     self.profiler.avg("node_count"),
                     self.profiler.max("node_count")
+                ));
+                ui.label(format!(
+                    "Acquire: {:.2}ms (max {:.2}ms)",
+                    self.profiler.avg("acquire"),
+                    self.profiler.max("acquire")
+                ));
+                ui.label(format!(
+                    "Present: {:.2}ms (max {:.2}ms)",
+                    self.profiler.avg("present"),
+                    self.profiler.max("present")
+                ));
+                ui.separator();
+                ui.label(format!(
+                    "Frame total: {:.2}ms (max {:.2}ms)",
+                    self.profiler.avg("frame_total"),
+                    self.profiler.max("frame_total")
+                ));
+                ui.label(format!(
+                    "Outside render(): {:.2}ms",
+                    self.profiler.avg("frame_total") - self.profiler.avg("render")
                 ));
                 ui.separator();
 
@@ -841,8 +864,11 @@ impl State {
             );
         }
         self.queue.submit(std::iter::once(encoder.finish()));
+        let present_start = Instant::now();
         self.window.pre_present_notify();
         self.queue.present(surface_texture);
+        self.profiler
+            .record("present", present_start.elapsed().as_secs_f32() * 1000.0);
         let render_end = Instant::now();
 
         let stall_duration = tree_build_start.duration_since(write_buffer_end);

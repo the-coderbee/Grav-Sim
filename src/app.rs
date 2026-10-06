@@ -11,11 +11,15 @@ use crate::state::State;
 
 pub struct App {
     state: Option<State>,
+    particle_count: usize,
 }
 
 impl App {
-    pub fn new() -> Self {
-        Self { state: None }
+    pub fn new(particle_count: usize) -> Self {
+        Self {
+            state: None,
+            particle_count: particle_count,
+        }
     }
 }
 
@@ -29,7 +33,7 @@ impl ApplicationHandler for App {
                 .with_visible(true);
 
             let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
-            let state = pollster::block_on(State::new(window));
+            let state = pollster::block_on(State::new(window, self.particle_count));
 
             state.window().request_redraw();
 
