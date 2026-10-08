@@ -9,6 +9,7 @@ use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
 use std::time::Instant;
 
+use crate::app::AppConfig;
 use crate::camera::{CameraController, CameraUniform};
 use crate::geometry::QuadTree;
 use crate::geometry::{QUAD_VERTICES, QuadVertex};
@@ -78,6 +79,12 @@ impl Profiler {
     }
 }
 
+pub struct GpuTimestamps {
+    pub query_set: wgpu::QuerySet,
+    pub resolve: wgpu::Buffer,
+    pub readback: wgpu::Buffer,
+}
+
 pub struct State {
     // the order is must to maintain the drop order after execution.
     pub render_pipeline: wgpu::RenderPipeline,
@@ -90,6 +97,8 @@ pub struct State {
     pub particle_buffers: [wgpu::Buffer; 2],
     pub sim_params_buffer: wgpu::Buffer,
     pub egui_renderer: EguiRenderer,
+
+    pub timestamps: Option<GpuTimestamps>,
 
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -117,11 +126,11 @@ pub struct State {
 }
 
 impl State {
-    pub async fn new(window: Arc<Window>, requested_particles: usize) -> Self {
+    pub async fn new(window: Arc<Window>, config: AppConfig) -> Self {
         let mut size = window.inner_size();
         if size.width == 0 || size.height == 0 {
-            size.width = 800;
-            size.height = 600;
+            size.width = config.width;
+            size.height = config.height;
         }
 
         let instance = wgpu::Instance::default();
@@ -146,7 +155,7 @@ impl State {
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::empty(),
+                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
                 required_limits: wgpu::Limits::default(),
                 label: None,
                 memory_hints: Default::default(),
@@ -154,6 +163,31 @@ impl State {
             })
             .await
             .unwrap();
+
+        let timestamps = if device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            Some(GpuTimestamps {
+                query_set: device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("Timestamps"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: 4,
+                }),
+                resolve: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Timestamp Resolve"),
+                    size: 4 * 8,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
+                readback: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Timestamp Readback"),
+                    size: 4 * 8,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+            })
+        } else {
+            println!("GPU timestamps not supported on this adapter");
+            None
+        };
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -177,7 +211,7 @@ impl State {
         surface.configure(&device, &surface_config);
 
         let galaxy_config = GalaxyConfig {
-            particle_count: requested_particles,
+            particle_count: config.particles,
             central_mass: 150_000.0,
             disk_partial_mass: 1.0,
             g_const: 1000.0,
@@ -526,6 +560,7 @@ impl State {
             ui_state,
             last_frame_time,
             profiler,
+            timestamps,
         }
     }
 
@@ -557,8 +592,6 @@ impl State {
 
     pub fn render(&mut self) -> Result<(), String> {
         let render_start = Instant::now();
-        self.profiler
-            .record("acquire", render_start.elapsed().as_secs_f32() * 1000.0);
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture) => texture,
             wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
@@ -570,6 +603,8 @@ impl State {
                 return Ok(());
             }
         };
+        self.profiler
+            .record("acquire", render_start.elapsed().as_secs_f32() * 1000.0);
         let view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -636,6 +671,17 @@ impl State {
                 ui.label(format!(
                     "Outside render(): {:.2}ms",
                     self.profiler.avg("frame_total") - self.profiler.avg("render")
+                ));
+                ui.separator();
+                ui.label(format!(
+                    "GPU Compute: {:.2}ms (max {:.2}ms)",
+                    self.profiler.avg("gpu_compute"),
+                    self.profiler.max("gpu_compute")
+                ));
+                ui.label(format!(
+                    "GPU Render: {:.2}ms (max {:.2}ms)",
+                    self.profiler.avg("gpu_render"),
+                    self.profiler.max("gpu_render")
                 ));
                 ui.separator();
 
@@ -715,6 +761,18 @@ impl State {
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
+        let ts_receiver = match &self.timestamps {
+            Some(ts) if self.frame_count > 0 => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                ts.readback
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |r| {
+                        let _ = tx.send(r);
+                    });
+                Some(rx)
+            }
+            _ => None,
+        };
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .unwrap();
@@ -722,6 +780,24 @@ impl State {
             .recv()
             .unwrap()
             .expect("Failed to map staging buffer");
+        if let (Some(rx), Some(ts)) = (ts_receiver, &self.timestamps) {
+            rx.recv().unwrap().expect("Failed to map timestamp buffer");
+            let t: Vec<u64> = {
+                let data = ts
+                    .readback
+                    .slice(..)
+                    .get_mapped_range()
+                    .expect("Failed to get timestamp range");
+                bytemuck::cast_slice(&data).to_vec()
+            };
+            ts.readback.unmap();
+
+            let period = self.queue.get_timestamp_period() as f64; // nanoseconds per tick
+            let compute_ms = t[1].saturating_sub(t[0]) as f64 * period / 1e6;
+            let render_ms = t[3].saturating_sub(t[2]) as f64 * period / 1e6;
+            self.profiler.record("gpu_compute", compute_ms as f32);
+            self.profiler.record("gpu_render", render_ms as f32);
+        }
 
         let tree_build_start = Instant::now();
 
@@ -826,7 +902,13 @@ impl State {
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("N-Body Compute Pass"),
-                timestamp_writes: None,
+                timestamp_writes: self.timestamps.as_ref().map(|ts| {
+                    wgpu::ComputePassTimestampWrites {
+                        query_set: &ts.query_set,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    }
+                }),
             });
 
             let bind_group_index = self.frame_count % 2;
@@ -856,6 +938,13 @@ impl State {
                     },
                     depth_slice: None,
                 })],
+                timestamp_writes: self.timestamps.as_ref().map(|ts| {
+                    wgpu::RenderPassTimestampWrites {
+                        query_set: &ts.query_set,
+                        beginning_of_pass_write_index: Some(2),
+                        end_of_pass_write_index: Some(3),
+                    }
+                }),
                 ..Default::default()
             });
 
@@ -872,6 +961,10 @@ impl State {
                 &clipped_primtives,
                 &screen_descriptor,
             );
+        }
+        if let Some(ts) = &self.timestamps {
+            encoder.resolve_query_set(&ts.query_set, 0..4, &ts.resolve, 0);
+            encoder.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, 32);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         let present_start = Instant::now();

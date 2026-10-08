@@ -9,16 +9,23 @@ use winit::{
 
 use crate::state::State;
 
+#[derive(Debug, Clone, Copy)]
+pub struct AppConfig {
+    pub particles: usize,
+    pub width: u32,
+    pub height: u32,
+}
+
 pub struct App {
     state: Option<State>,
-    particle_count: usize,
+    config: AppConfig,
 }
 
 impl App {
-    pub fn new(particle_count: usize) -> Self {
+    pub fn new(app_config: AppConfig) -> Self {
         Self {
             state: None,
-            particle_count: particle_count,
+            config: app_config,
         }
     }
 }
@@ -29,11 +36,14 @@ impl ApplicationHandler for App {
         if self.state.is_none() {
             let window_attributes = Window::default_attributes()
                 .with_title("GravSim - Particle Simulator [Winit + WGPU]")
-                .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
+                .with_inner_size(winit::dpi::PhysicalSize::new(
+                    self.config.width,
+                    self.config.height,
+                ))
                 .with_visible(true);
 
             let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
-            let state = pollster::block_on(State::new(window, self.particle_count));
+            let state = pollster::block_on(State::new(window, self.config));
 
             state.window().request_redraw();
 

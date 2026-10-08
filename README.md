@@ -1,6 +1,6 @@
 # Grav-Sim
 
-A GPU-accelerated 2D gravitational N-body simulation written in Rust. It uses the Barnes-Hut algorithm on wgpu compute shaders and simulates a 100,000-body galaxy interactively.
+This is a GPU-accelerated 2D gravitational N-body simulation written in Rust. It uses the Barnes-Hut algorithm on wgpu compute shaders and simulates a 100,000-body galaxy interactively.
 
 ![Grav-Sim simulating a 50,000-body galaxy](docs/grav-sim.gif)
 
@@ -37,19 +37,31 @@ Disk particles are placed uniformly by area between a minimum and maximum radius
 
 ## Performance
 
-Measured on an **NVIDIA GeForce GTX 1650 Ti** (laptop, Vulkan backend), release build, 800×600 window, θ = 0.5, after letting each run settle for 60 seconds. Values are averages over the profiler's 60-frame window.
+Measured on an **NVIDIA GeForce GTX 1650 Ti** (laptop, Vulkan backend), release build, 800×600 window, θ = 0.5, after letting each run settle for 60 seconds. Values are averages over the profiler's 60-frame window. GPU times come from wgpu timestamp queries written at the start and end of each pass.
 
-| Particles | FPS | Frame total | Tree build (CPU) | Tree upload | `render()` total (CPU) | Outside `render()` | Tree nodes |
+| Particles | FPS | Frame total | Tree build (CPU) | Tree upload | GPU compute | GPU render | Tree nodes |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 10,000 | 143.7 | 6.94 ms | 1.39 ms | 0.25 ms | 2.23 ms | 4.72 ms | ~29,400 |
-| 50,000 | 36.9 | 27.76 ms | 7.83 ms | 1.29 ms | 10.01 ms | 17.75 ms | ~151,500 |
-| 100,000 | 15.0 | 67.73 ms | 19.04 ms | 2.53 ms | 22.85 ms | 44.88 ms | ~301,100 |
+| 10,000 | 143.2 | 6.94 ms | 1.27 ms | 0.25 ms | 2.17 ms | 0.09 ms | ~29,300 |
+| 50,000 | 35.8 | 27.84 ms | 7.89 ms | 1.27 ms | 16.83 ms | 0.13 ms | ~150,500 |
+| 100,000 | 15.7 | 64.75 ms | 17.98 ms | 2.57 ms | 41.55 ms | 0.26 ms | ~303,900 |
+
+*GPU render includes the egui panel.*
 
 ### Where the time goes
 
-Almost all of the CPU work inside `render()` is the quadtree build. The largest cost, though, is the time outside `render()`, which grows with particle count. <!-- TODO: confirm with GPU timestamp queries, then state the measured GPU compute time here -->
+At 100,000 particles, a frame breaks down roughly like this:
 
-The frame is effectively serial: the GPU has to finish before the CPU can read positions back, and the CPU has to finish the tree before the GPU can start the next step. Neither side works while the other does.
+- **GPU Barnes-Hut traversal: 41.6 ms (64%).** This is the largest cost by far.
+- **CPU quadtree build: 18.0 ms (28%).**
+- **Tree upload: 2.6 ms (4%).**
+- **Drawing the particles: 0.26 ms.** Rendering is effectively free.
+
+Two findings came out of measuring this rather than guessing:
+
+1. **The compute shader, not the CPU, is the bottleneck.** Before adding timestamp queries, the CPU tree build looked like the main cost because it was the only thing the CPU timers could see. The GPU timestamps show the traversal takes more than twice as long.
+2. **The frame is serial.** The GPU compute time and the CPU time add up to almost the whole frame (63.4 of 64.8 ms at 100k), because the GPU has to finish before the CPU can read positions back, and the CPU has to finish the tree before the GPU can start the next step. Neither side works while the other does.
+
+Traversal cost also grows faster than the O(N log N) the algorithm suggests: doubling from 50k to 100k particles multiplies GPU compute time by about 2.5×. I haven't profiled the cause yet; the likely candidates are scattered memory access during tree traversal and threads in the same workgroup taking very different paths through the tree.
 
 ## Running it
 
@@ -75,8 +87,11 @@ Always use `--release`; debug builds are dramatically slower.
 
 ## Limitations and next steps
 
-- **Build the quadtree on the GPU.** This removes the per-frame readback and the CPU tree build, which are the main costs at high particle counts.
-- **Overlap CPU and GPU work.** Building the tree from the previous frame's positions would let the CPU and GPU run in parallel, at the cost of one frame of latency in the tree.
+Ordered by expected impact, based on the measurements above:
+
+- **Make tree traversal cheaper on the GPU.** It is 64% of the frame at 100k. Sorting particles along a space-filling curve (Morton order) would make neighbouring threads walk similar paths through the tree and read nearby memory, which should help with both suspected causes above.
+- **Overlap CPU and GPU work.** Building the tree from the previous frame's positions would let the CPU build and GPU traversal run in parallel, at the cost of one frame of latency in the tree. At 100k, the frame would then be bounded by the slower of the two (about 42 ms) instead of their sum (about 60 ms).
+- **Build the quadtree on the GPU.** This removes the per-frame readback, the CPU tree build and the upload entirely.
 - **Fixed traversal stack.** The compute shader uses a 64-entry stack with no overflow guard, which limits the maximum tree depth it can safely traverse.
 - **2D only, single precision.** Positions use `f32`, which limits accuracy for very large or very long-running simulations.
 
